@@ -39,6 +39,7 @@ def get_device():
 
 device = get_device()
 
+
 class CausalSelfAttention(nn.Module):
 
     def __init__(self, config):
@@ -108,7 +109,7 @@ class Block(nn.Module):
 @dataclass
 class GPTConfig:
     block_size: int = 1024 # max sequence length/context
-    vocab_size: int = 50257 # num of tokens, 50k merges, 256 bytes, 1 EOT
+    vocab_size: int = 100276 # switched to GP4 tokenizer 
     n_layer: int = 12 
     n_head: int = 12
     n_embd: int = 768
@@ -190,7 +191,8 @@ class GPT(nn.Module):
         optimizer = torch.optim.AdamW(optim_groups, lr=learning_rate, betas=(0.9, 0.95), eps=1e-8, fused=use_fused)
         return optimizer
 
-        def load_tokens(filename):
+
+def load_tokens(filename):
     print(f'loading {filename}')
     npt = np.load(filename)
     npt = npt.astype(np.int32)
@@ -237,7 +239,6 @@ class DataLoaderLite:
         self.current_position += B * T * self.num_processes
         return x, y
 
-
 # set up DDP (distributed data parallel).
 # torchrun command sets the env variables RANK, LOCAL_RANK, and WORLD_SIZE
 device_type = device # override device if using ddp do device_type acts as backup
@@ -260,8 +261,8 @@ else:
     master_process = True
     print(f'not using ddp, using device: {device}')
 
-total_batch_size = 2**17 #524288 # 2**19, ~0.5M, in number of tokens, made smaller for testing 
-B = 4 # micro batch size
+total_batch_size = 589824 #524288 # 2**19, ~0.5M, in number of tokens, made smaller for testing 
+B = 96 # micro batch size
 T = 1024 # sequence length
 assert total_batch_size % (B * T * ddp_world_size) == 0, 'make sure total_batch_size is divisible by B * T * ddp_world_size'
 grad_accum_steps = total_batch_size // (B * T * ddp_world_size)
@@ -274,7 +275,7 @@ test_loader = DataLoaderLite(B=B, T=T, process_rank=ddp_rank, num_processes=ddp_
 
 torch.set_float32_matmul_precision('high')
 
-model = GPT(GPTConfig(vocab_size=2**17)) # make divisible by power of 2 was 50304
+model = GPT(GPTConfig(vocab_size=100608)) # make divisible by power of 2 was 50304
 model.to(device)
 model = torch.compile(model)
 if ddp:
@@ -283,10 +284,10 @@ if ddp:
 raw_model = model.module if ddp else model # always contains the "raw" unwrapped model
 lossi = []
 
-max_lr = 1e-3
-min_lr = max_lr * 0.1
-max_steps = 100 # to be adjusted in a bit, should be ~ 1-2 epochs so total training tokens / batch size
-warmup_steps = 0.05 * max_steps # 5% warmup
+max_lr = 8e-5 # match what LR was at 10k
+min_lr = max_lr * 0.01
+max_steps = 10000 
+warmup_steps = 0.001 * max_steps # 5% warmup
 weight_decay = 0.1
 def get_lr(it):
     # 1/ linear warmup 
@@ -301,12 +302,11 @@ def get_lr(it):
     coeff = 0.5 * (1.0 + math.cos(math.pi * decay_ratio)) # coeff starts at 1 and goes to 0
     return min_lr + coeff * (max_lr - min_lr)
 
-#optimizer = torch.optim.AdamW(model.parameters(), lr=min_lr, betas=(0.9, 0.95), eps=1e-8)
 optimizer = raw_model.configure_optimizers(weight_decay=0.1, learning_rate=max_lr, device_type=device_type)
 enc = tiktoken.get_encoding('cl100k_base')
 
-log_file = log_path / 'log.txt'
-with open(log_file, "w") as f: # open for writing to clear the file
+log_file = log_path / 'log_restart2.txt'
+with open(log_file, 'w') as f: # open for writing to clear the file
     pass
 
 for step in range(max_steps):
@@ -314,7 +314,7 @@ for step in range(max_steps):
     last_step = (step == max_steps - 1)
     
     # once in a while evaluate our test loss
-    if step % 10 == 0 or last_step:
+    if step % 500 == 0 or last_step:
         model.eval()
         test_loader.reset()
         with torch.no_grad():
@@ -323,8 +323,8 @@ for step in range(max_steps):
             for _ in range(test_loss_steps):
                 x, y = test_loader.next_batch()
                 x, y = x.to(device), y.to(device)
-                #with torch.autocast(device_type=device_type, dtype=torch.bfloat16):
-                logits, loss = model(x, y)
+                with torch.autocast(device_type=device_type, dtype=torch.bfloat16):
+                    logits, loss = model(x, y)
                 loss = loss / test_loss_steps
                 test_loss_accum += loss.detach()
         if ddp:
@@ -333,7 +333,7 @@ for step in range(max_steps):
             print(f'test loss: {test_loss_accum.item():.4f}')
             with open(log_file, "a") as f:
                 f.write(f'{step} test {test_loss_accum.item():.4f}\n')
-            if step > 0 or last_step:
+            if step > 0 and (step % 1000 == 0 or last_step):
                 # optionally write model checkpoints
                 checkpoint_path = model_path / f'model_{step:05d}.pt'
                 checkpoint = {
@@ -347,7 +347,7 @@ for step in range(max_steps):
                 torch.save(checkpoint, checkpoint_path)
 
     # once in a while generate from the model (except step 0, which is noise)
-    if ((step > 0 and step % 10 == 0) or last_step):
+    if ((step > 0 and step % 500 == 0) or last_step):
         model.eval()
         num_return_sequences = 2
         max_length = 32
@@ -360,8 +360,8 @@ for step in range(max_steps):
         while xgen.size(1) < max_length:
             # forward the model to get the logits
             with torch.no_grad():
-                #with torch.autocast(device_type=device_type, dtype=torch.bfloat16):
-                logits, loss = model(xgen) # (B, T, vocab_size)
+                with torch.autocast(device_type=device_type, dtype=torch.bfloat16):
+                    logits, loss = model(xgen) # (B, T, vocab_size)
                 # take the logits at the last position
                 logits = logits[:, -1, :] # (B, vocab_size)
                 # get the probabilities
@@ -392,8 +392,8 @@ for step in range(max_steps):
         # added after video, this field is also used by the forward pass.
         if ddp:
             model.require_backward_grad_sync = (micro_step == grad_accum_steps - 1)
-        #with torch.autocast(device_type=device_type, dtype=torch.bfloat16):
-        logits, loss = model(x, y)
+        with torch.autocast(device_type=device_type, dtype=torch.bfloat16):
+            logits, loss = model(x, y)
         loss = loss / grad_accum_steps
         loss_accum += loss.detach()
         loss.backward()
@@ -414,9 +414,7 @@ for step in range(max_steps):
         lossi.append(loss_accum.item())
         print(f'step {step:5d} | loss: {loss_accum.item():.6f} | lr {lr:.4e}| dt: {dt*1000:.2f}ms | tok/sec: {tokens_per_sec:.2f}')
         with open(log_file, 'a') as f:
-            f.write(f"{step} train {loss_accum.item():.6f}\n")
+            f.write(f'{step} train {loss_accum.item():.6f}\n')
 
 if ddp:
     destroy_process_group()
-
-plt.plot(lossi)
